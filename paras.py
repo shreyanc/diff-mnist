@@ -4,7 +4,7 @@ import torch.optim as optim
 from torchvision import datasets
 import torchvision.transforms as transforms
 from torchvision.transforms import functional as F
-from diffusers import UNet2DModel
+from diffusers import UNet2DModel, UNet2DConditionModel
 from torchvision.transforms import ToPILImage
 
 from matplotlib import pyplot as plt
@@ -20,7 +20,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def ddpm_schedules(beta1: float, beta2: float, T: int):
-    # Generate the beta values linearly from beta_start to beta_end
     beta_t = torch.linspace(beta1, beta2, T).to(device)
     sqrt_beta_t = torch.sqrt(beta_t)
 
@@ -45,91 +44,111 @@ def ddpm_schedules(beta1: float, beta2: float, T: int):
     )
 
 
-class DiffusionModel(nn.Module):
-    def __init__(self, img_size, num_classes=10, class_emb_size=4):
+
+class EpsModelDiffusersConditional(nn.Module):
+    """
+    Not working
+    """
+    def __init__(self, label_emb_size=128):
         super().__init__()
+        self.model = UNet2DConditionModel(
+            sample_size=(28, 28),
+            in_channels=1,
+            out_channels=1,
+        )
 
-        # The embedding layer will map the class label to a vector of size class_emb_size
-        self.class_emb = nn.Embedding(num_classes, class_emb_size)
+        self.class_embed = nn.Embedding(10, 128)  # Assuming 10 classes and embedding size of 128
 
+    def forward(self, x, t, class_labels):
+        batch_size, _, height, width = x.shape
+        class_embeds = self.class_embed(class_labels)
+        class_embeds = class_embeds.unsqueeze(1).unsqueeze(2)  # Shape (batch_size, 1, 1, embedding_dim)
+        encoder_hidden_states = class_embeds.expand(batch_size, height, width, -1)
+        encoder_hidden_states = encoder_hidden_states.reshape(batch_size, -1, 128)  # Reshape to (batch_size, sequence_length, embedding_dim)
+        return self.model(x, t, encoder_hidden_states)
+
+
+
+class EpsModelDiffusers(nn.Module):
+    def __init__(self, class_emb_size=128):
+        super().__init__()
+        self.class_emb = nn.Embedding(10, class_emb_size)
         self.model = UNet2DModel(
-            sample_size=img_size,  # the target image resolution
-            in_channels=1
-            + class_emb_size,  # Additional input channels to accept the conditioning information (the class)
-            out_channels=1,  # the number of output channels
-            layers_per_block=2,  # how many ResNet layers to use per UNet block
+            sample_size=(28,28),
+            in_channels=1+class_emb_size,
+            out_channels=1,
+            layers_per_block=2,        # how many ResNet layers to use per UNet block
             block_out_channels=(32, 64, 64),
             down_block_types=(
-                "DownBlock2D",  # a regular ResNet downsampling block
-                "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+                "DownBlock2D",          # a regular ResNet downsampling block
+                "AttnDownBlock2D",      # a ResNet downsampling block with spatial self-attention
                 "AttnDownBlock2D",
             ),
             up_block_types=(
-                "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+                "AttnUpBlock2D",        # a ResNet upsampling block with spatial self-attention
                 "AttnUpBlock2D",
-                "UpBlock2D",  # a regular ResNet upsampling block
-            ),
-        )
-
-    # Our forward method now takes the class labels as an additional argument
-    def forward(self, x_t, t, class_label):
-        # Shape of x:
-        bs, ch, w, h = x_t.shape
-
-        # class conditioning is right shape to add as additional input channel
-        class_cond = self.class_emb(class_label).view(
-            bs, self.class_emb.embedding_dim, 1, 1
-        )
-        class_cond = class_cond.expand(bs, self.class_emb.embedding_dim, w, h)
-        # x is shape (bs, 1, 28, 28) and class_cond is now (bs, 4, 28, 28)
-
-        # Net input is now x and class cond concatenated together along dimension 1
-        net_input = torch.cat((x_t, class_cond), 1)  # (bs, 5, 28, 28)
-
-        # Feed the UNet with net_input, time step t, and return the prediction
-        return self.model(net_input, t).sample  # (bs, 1, 28, 28)
-
-    def sample(self, n_sample: int, size, n_T, sched, device) -> torch.Tensor:
-
-        x_i = torch.randn(n_sample, *size).to(device)  # x_T ~ N(0, 1)
-        y = torch.randint(0, 10, (n_sample,)).to(device)  # Generate random target labels
-
-        bs, ch, w, h = x_i.shape
-
-        # class conditioning is right shape to add as additional input channel
-        class_cond = self.class_emb(y).view(
-            bs, self.class_emb.embedding_dim, 1, 1
-        )
-        class_cond = class_cond.expand(bs, self.class_emb.embedding_dim, w, h)
-        # x is shape (bs, 1, 28, 28) and class_cond is now (bs, 4, 28, 28)
-
-        # Net input is now x and class cond concatenated together along dimension 1
-        net_input = torch.cat((x_i, class_cond), 1)  
-
-        # This samples accordingly to Algorithm 2. It is exactly the same logic.
-        for i in range(n_T-1, 0, -1):
-            z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
-            eps = self.model(net_input, torch.tensor(i).to(device) / n_T).sample
-            x_i = (
-                sched.oneover_sqrta[i] * (x_i - eps * sched.mab_over_sqrtmab[i])
-                + sched.sqrt_beta_t[i] * z
+                "UpBlock2D",            # a regular ResNet upsampling block
             )
+        )
 
-        return x_i, y
+    def forward(self, x, t, class_labels):
+        bs, _, h, w = x.shape
+        class_cond = self.class_emb(class_labels).view(bs, self.class_emb.embedding_dim, 1, 1)
+        class_cond = class_cond.expand(bs, self.class_emb.embedding_dim, h, w)
+        net_input = torch.cat((x, class_cond), 1)
+        return self.model(net_input, t).sample
+
+
+class DDPMConditional(nn.Module):
+    def __init__(self, eps_model, betas, n_T):
+        super().__init__()
+
+        self.img_size = [28, 28]
+        self.betas = betas
+        self.n_T = n_T
+
+        self.criterion = nn.MSELoss()
+
+        self.eps_model = eps_model
+
+        self.scheds = ddpm_schedules(self.betas[0], self.betas[1], self.n_T)
+
+    def forward(self, x_0, class_label):
+        t = torch.randint(0, self.n_T, (x_0.shape[0],), device=device)
+        eps = torch.randn_like(x_0, device=device)
+
+        x_t = (
+            self.scheds.sqrtab[t, None, None, None] * x_0
+            + self.scheds.sqrtmab[t, None, None, None] * eps
+        )
+
+        eps_pred = self.eps_model(x_t, t / self.n_T, class_label)
+
+        loss = self.criterion(eps, eps_pred)
+
+        return loss
+
+    def sample(self, n_samples: int) -> torch.Tensor:
+
+        x_t = torch.randn(n_samples, 1, *self.img_size).to(device)  # x_T ~ N(0, 1)
+        y = torch.randint(0, 10, (n_samples,)).to(device)  # Generate random target labels
+
+        for t in range(self.n_T-1, 0, -1):
+            z = torch.randn(n_samples, 1, *self.img_size).to(device) if t > 1 else 0
+            eps_pred = self.eps_model(x_t, torch.tensor(t).to(device) / self.n_T, y)
+            x_t = (
+                self.scheds.oneover_sqrta[t]
+                * (x_t - eps_pred * self.scheds.mab_over_sqrtmab[t])
+                + self.scheds.sqrt_beta_t[t] * z
+            )
+        
+        return x_t, y
 
 
 def train_mnist(n_epoch: int = 100, device="cuda:0") -> None:
 
-    # ddpm = DDPM(eps_model=DummyEpsModel(1), betas=(1e-4, 0.02), n_T=1000)
-
-    # ddpm = DDPM(eps_model=ContextUnet(1), betas=(1e-4, 0.02), n_T=1000)
-    # ddpm.to(device)
-
-    n_T = 1000
-    criterion = nn.MSELoss()
-
-    ddpm = DiffusionModel(img_size=28, num_classes=10).to(device)
-    ddpm_sched = ddpm_schedules(1e-4, 0.02, 1000)
+    ddpm = DDPMConditional(eps_model=EpsModelDiffusers(), betas=(1e-4, 0.02), n_T=1000)
+    ddpm.to(device)
 
     tf = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.5,), (1.0))]
@@ -153,17 +172,8 @@ def train_mnist(n_epoch: int = 100, device="cuda:0") -> None:
             optim.zero_grad()
             x = x.to(device)
             labels = labels.to(device)
-            t = torch.randint(0, n_T, (x.shape[0],), device=device)
-            eps = torch.randn_like(x, device=device)
 
-            x_t = (
-                ddpm_sched.sqrtab[t, None, None, None] * x
-                + ddpm_sched.sqrtmab[t, None, None, None] * eps
-            )
-
-            eps_pred = ddpm(x_t, t/n_T, labels)
-
-            loss = criterion(eps, eps_pred)
+            loss = ddpm(x, labels)
 
             loss.backward()
 
@@ -176,27 +186,26 @@ def train_mnist(n_epoch: int = 100, device="cuda:0") -> None:
 
         ddpm.eval()
         with torch.no_grad():
-            # Assuming `ddpm` is defined and initialized somewhere in your code
-            xh, y = ddpm.sample(16, (1, 28, 28), n_T, ddpm_sched, device)
+            xh, y = ddpm.sample(16)
+            # grid = make_grid(xh, nrow=4)
+            # save_image(grid, f"ContextUnet_ddpm_sample_{i}.png")
 
-            # Convert xh to PIL images
-            to_pil = ToPILImage()
-            pil_images = [to_pil(img) for img in xh]
+            images = [img.squeeze().cpu().numpy() for img in xh]
 
             # Plot the images using matplotlib subplots
-            fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+            fig, axes = plt.subplots(4, 4, figsize=(4, 4))
             axes = axes.flatten()
 
-            for img, label, ax in zip(pil_images, y, axes):
+            for img, label, ax in zip(images, y, axes):
                 ax.imshow(img, cmap='gray')
                 ax.set_title(str(label.item()))
                 ax.axis('off')
 
             plt.tight_layout()
-            plt.savefig(f"Paras_ddpm_sample_{i}.png")
+            plt.savefig(f"CondDiffusersUnet_ddpm_sample_{i}.png", dpi=100)
 
             # save model
-            torch.save(ddpm.state_dict(), f"./Paras_ddpm_mnist.pth")
+            torch.save(ddpm.state_dict(), f"./CondDiffusersUnet_ddpm_mnist.pth")
 
 
 if __name__ == "__main__":
