@@ -8,7 +8,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-
+from matplotlib import pyplot as plt
 
 from torchvision.datasets import MNIST
 from torchvision import transforms
@@ -228,7 +228,7 @@ class ContextUnet(nn.Module):
             nn.Conv2d(n_feat, self.in_channels, 3, 1, 1),
         )
 
-    def forward(self, x, t):
+    def forward(self, x, t, c):
         # x is (noisy) image, c is context label, t is timestep, 
         # context_mask says which samples to block the context on
 
@@ -238,7 +238,7 @@ class ContextUnet(nn.Module):
         hiddenvec = self.to_vec(down2)
 
         # convert context to one hot embedding
-        # c = nn.functional.one_hot(c, num_classes=self.n_classes).type(torch.float)
+        c = nn.functional.one_hot(c, num_classes=self.n_classes).type(torch.float)
         
         # mask out context if context_mask == 1
         # context_mask = context_mask[:, None]
@@ -247,16 +247,16 @@ class ContextUnet(nn.Module):
         # c = c * context_mask
         
         # embed context, time step
-        # cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
+        cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
         temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
-        # cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
+        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
         temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
 
         # could concatenate the context embedding here instead of adaGN
         # hiddenvec = torch.cat((hiddenvec, temb1, cemb1), 1)
 
-        cemb1 = 1.0
-        cemb2 = 1.0
+        # cemb1 = 1.0
+        # cemb2 = 1.0
         up1 = self.up0(hiddenvec)
         # up2 = self.up1(up1, down2) # if want to avoid add and multiply embeddings
         up2 = self.up1(cemb1*up1+ temb1, down2)  # add and multiply embeddings
@@ -284,7 +284,7 @@ class DDPM(nn.Module):
         self.n_T = n_T
         self.criterion = criterion
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, labels) -> torch.Tensor:
         """
         Makes forward diffusion x_t, and tries to guess epsilon value from x_t using eps_model.
         This implements Algorithm 1 in the paper.
@@ -301,22 +301,24 @@ class DDPM(nn.Module):
         )  # This is the x_t, which is sqrt(alphabar) x_0 + sqrt(1-alphabar) * eps
         # We should predict the "error term" from this x_t. Loss is what we return.
 
-        return self.criterion(eps, self.eps_model(x_t, _ts / self.n_T))
+        return self.criterion(eps, self.eps_model(x_t, _ts / self.n_T, labels))
 
     def sample(self, n_sample: int, size, device) -> torch.Tensor:
 
         x_i = torch.randn(n_sample, *size).to(device)  # x_T ~ N(0, 1)
+        y = torch.randint(0, 10, (n_sample,)).to(device)  # Generate random target labels
+
 
         # This samples accordingly to Algorithm 2. It is exactly the same logic.
         for i in range(self.n_T, 0, -1):
             z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
-            eps = self.eps_model(x_i, torch.tensor(i).to(device) / self.n_T)
+            eps = self.eps_model(x_i, torch.tensor(i).to(device) / self.n_T, y)
             x_i = (
                 self.oneover_sqrta[i] * (x_i - eps * self.mab_over_sqrtmab[i])
                 + self.sqrt_beta_t[i] * z
             )
 
-        return x_i
+        return x_i, y
 
 
 def train_mnist(n_epoch: int = 100, device="cuda:0") -> None:
@@ -344,10 +346,12 @@ def train_mnist(n_epoch: int = 100, device="cuda:0") -> None:
 
         pbar = tqdm(dataloader)
         loss_ema = None
-        for x, _ in pbar:
+        for x, labels in pbar:
             optim.zero_grad()
             x = x.to(device)
-            loss = ddpm(x)
+            labels = labels.to(device)
+
+            loss = ddpm(x, labels)
             loss.backward()
             if loss_ema is None:
                 loss_ema = loss.item()
@@ -358,12 +362,26 @@ def train_mnist(n_epoch: int = 100, device="cuda:0") -> None:
 
         ddpm.eval()
         with torch.no_grad():
-            xh = ddpm.sample(16, (1, 28, 28), device)
-            grid = make_grid(xh, nrow=4)
-            save_image(grid, f"ContextUnet_ddpm_sample_{i}.png")
+            xh, y = ddpm.sample(16, (1, 28, 28), device)
+            # grid = make_grid(xh, nrow=4)
+            # save_image(grid, f"ContextUnet_ddpm_sample_{i}.png")
+
+            images = [img.squeeze().cpu().numpy() for img in xh]
+
+            # Plot the images using matplotlib subplots
+            fig, axes = plt.subplots(4, 4, figsize=(4, 4))
+            axes = axes.flatten()
+
+            for img, label, ax in zip(images, y, axes):
+                ax.imshow(img, cmap='gray')
+                ax.set_title(str(label.item()))
+                ax.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(f"ContextUnetCond_ddpm_sample_{i}.png", dpi=100)
 
             # save model
-            torch.save(ddpm.state_dict(), f"./ContextUnet_ddpm_mnist.pth")
+            torch.save(ddpm.state_dict(), f"./ContextUnetCond_ddpm_mnist.pth")
 
 
 if __name__ == "__main__":
