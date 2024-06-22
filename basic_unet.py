@@ -329,7 +329,8 @@ def train_mnist(n_epoch: int = 100, device="cuda:0") -> None:
     ddpm.to(device)
 
     tf = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.5,), (1.0))]
+        [transforms.ToTensor(), 
+         transforms.Normalize((0.5,), (1.0))]
     )
 
     dataset = MNIST(
